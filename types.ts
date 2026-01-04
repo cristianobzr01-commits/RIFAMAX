@@ -34,6 +34,7 @@ export interface RaffleState {
   reservedNumbers: Map<number, { expiresAt: number }>;
   participants: Map<string, Participant>;
   phoneToNumbers: Map<string, number[]>;
+  emailToNumbers: Map<string, number[]>;
   participantToNumbers: Map<string, number[]>;
   winner?: {
     number: number;
