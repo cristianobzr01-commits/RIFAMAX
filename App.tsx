@@ -4,6 +4,7 @@ import { Participant, RaffleState, Purchase } from './types';
 import NumberGrid from './components/NumberGrid';
 import Dashboard from './components/Dashboard';
 import { generateRaffleDescription, announceWinner, generatePrizeImage } from './services/geminiService';
+import { dbService } from './services/databaseService';
 
 const PAGE_SIZE = 100;
 const INITIAL_PRICE = 0.00; 
@@ -13,7 +14,6 @@ const TOTAL_NUMBERS = 1000000;
 const RESERVATION_TIME = 5 * 60 * 1000;
 const ADMIN_PASSWORD = "198830cb";
 
-// Canal de comunicação para tempo real entre abas
 const raffleChannel = new BroadcastChannel('raffle_sync_channel');
 
 interface Activity {
@@ -31,34 +31,14 @@ Para participar e validar seu bilhete, você precisa:
 ✅ Curta a foto oficial no Instagram!`;
 
 const App: React.FC = () => {
-  const loadInitialState = (): RaffleState => {
-    const saved = localStorage.getItem('raffle_settings_live_v2');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return {
-          ...parsed,
-          soldNumbers: new Set(parsed.soldNumbers || []),
-          numberOwners: new Map(parsed.numberOwners || []),
-          reservedNumbers: new Map(),
-          participants: new Map(parsed.participants || []),
-          phoneToNumbers: new Map(parsed.phoneToNumbers || []),
-          emailToNumbers: new Map(parsed.emailToNumbers || []),
-          participantToNumbers: new Map(parsed.participantToNumbers || []),
-          winner: parsed.winner || undefined
-        };
-      } catch (e) { console.error(e); }
-    }
-    return {
-      totalNumbers: TOTAL_NUMBERS, pricePerNumber: INITIAL_PRICE, maxPurchaseLimit: INITIAL_LIMIT,
-      maxEntriesPerPhone: INITIAL_PHONE_LIMIT, soldNumbers: new Set<number>(),
-      numberOwners: new Map<number, string>(), reservedNumbers: new Map<number, { expiresAt: number }>(),
-      participants: new Map<string, Participant>(), phoneToNumbers: new Map<string, number[]>(),
-      emailToNumbers: new Map<string, number[]>(), participantToNumbers: new Map<string, number[]>(),
-    };
-  };
+  const [raffle, setRaffle] = useState<RaffleState>({
+    totalNumbers: TOTAL_NUMBERS, pricePerNumber: INITIAL_PRICE, maxPurchaseLimit: INITIAL_LIMIT,
+    maxEntriesPerPhone: INITIAL_PHONE_LIMIT, soldNumbers: new Set<number>(),
+    numberOwners: new Map<number, string>(), reservedNumbers: new Map<number, { expiresAt: number }>(),
+    participants: new Map<string, Participant>(), phoneToNumbers: new Map<string, number[]>(),
+    emailToNumbers: new Map<string, number[]>(), participantToNumbers: new Map<string, number[]>(),
+  });
 
-  const [raffle, setRaffle] = useState<RaffleState>(loadInitialState);
   const [isAdmin, setIsAdmin] = useState(() => localStorage.getItem('raffle_is_admin') === 'true');
   const [isAdminLoginOpen, setIsAdminLoginOpen] = useState(false);
   const [isAdminSettingsOpen, setIsAdminSettingsOpen] = useState(false);
@@ -67,6 +47,7 @@ const App: React.FC = () => {
   const [prizeImage, setPrizeImage] = useState(() => localStorage.getItem('raffle_prize_image') || "");
   const [tempDescription, setTempDescription] = useState(() => localStorage.getItem('raffle_description') || DEFAULT_DESCRIPTION);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isDbReady, setIsDbReady] = useState(false);
   const [activities, setActivities] = useState<Activity[]>([]);
   const [onlineUsers, setOnlineUsers] = useState(124);
 
@@ -77,61 +58,83 @@ const App: React.FC = () => {
   const [userPhone, setUserPhone] = useState("");
   const [userEmail, setUserEmail] = useState("");
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
-  const [myPurchases, setMyPurchases] = useState<Purchase[]>(() => {
-    try { return JSON.parse(localStorage.getItem('raffle_my_purchases') || '[]'); } catch { return []; }
-  });
+  const [myPurchases, setMyPurchases] = useState<Purchase[]>([]);
 
-  // Listener para atualizações em tempo real de outras instâncias
+  // Inicialização da Base de Dados
+  useEffect(() => {
+    const initDb = async () => {
+      await dbService.init();
+      const saved = await dbService.loadState();
+      if (saved) {
+        setRaffle({
+          ...saved,
+          soldNumbers: new Set(saved.soldNumbers),
+          numberOwners: new Map(saved.numberOwners),
+          reservedNumbers: new Map(),
+          participants: new Map(saved.participants),
+          phoneToNumbers: new Map(saved.phoneToNumbers),
+          emailToNumbers: new Map(saved.emailToNumbers),
+          participantToNumbers: new Map(saved.participantToNumbers),
+        });
+      }
+      const purchases = await dbService.getMyPurchases();
+      setMyPurchases(purchases);
+      setIsDbReady(true);
+    };
+    initDb();
+  }, []);
+
+  // Sync Listener
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       const { type, payload } = event.data;
       if (type === 'UPDATE_RAFFLE') {
         setIsSyncing(true);
-        const data = payload;
         setRaffle(prev => ({
           ...prev,
-          soldNumbers: new Set(data.soldNumbers),
-          numberOwners: new Map(data.numberOwners),
-          participants: new Map(data.participants),
-          phoneToNumbers: new Map(data.phoneToNumbers),
-          emailToNumbers: new Map(data.emailToNumbers),
-          participantToNumbers: new Map(data.participantToNumbers),
+          soldNumbers: new Set(payload.soldNumbers),
+          numberOwners: new Map(payload.numberOwners),
+          participants: new Map(payload.participants),
+          phoneToNumbers: new Map(payload.phoneToNumbers),
+          emailToNumbers: new Map(payload.emailToNumbers),
+          participantToNumbers: new Map(payload.participantToNumbers),
         }));
         setTimeout(() => setIsSyncing(false), 1000);
       } else if (type === 'NEW_ACTIVITY') {
         setActivities(prev => [payload, ...prev].slice(0, 5));
       }
     };
-
     raffleChannel.addEventListener('message', handleMessage);
     return () => raffleChannel.removeEventListener('message', handleMessage);
   }, []);
 
-  // Persistência e Sincronização de saída
+  // Gravação na Base de Dados ao mudar o estado
   useEffect(() => {
-    const dataToSave = {
-      ...raffle,
-      soldNumbers: Array.from(raffle.soldNumbers),
-      numberOwners: Array.from(raffle.numberOwners.entries()),
-      participants: Array.from(raffle.participants.entries()),
-      phoneToNumbers: Array.from(raffle.phoneToNumbers.entries()),
-      emailToNumbers: Array.from(raffle.emailToNumbers.entries()),
-      participantToNumbers: Array.from(raffle.participantToNumbers.entries()),
-    };
-    localStorage.setItem('raffle_settings_live_v2', JSON.stringify(dataToSave));
-    localStorage.setItem('raffle_my_purchases', JSON.stringify(myPurchases));
-    
-    // Notifica outras abas sobre a mudança
-    raffleChannel.postMessage({ type: 'UPDATE_RAFFLE', payload: dataToSave });
-  }, [raffle, myPurchases]);
+    if (isDbReady) {
+      dbService.saveState(raffle);
+      localStorage.setItem('raffle_description', tempDescription);
+      localStorage.setItem('raffle_prize_name', prizeName);
+      localStorage.setItem('raffle_prize_image', prizeImage);
+      localStorage.setItem('raffle_is_admin', isAdmin ? 'true' : 'false');
+      
+      raffleChannel.postMessage({ 
+        type: 'UPDATE_RAFFLE', 
+        payload: {
+          ...raffle,
+          soldNumbers: Array.from(raffle.soldNumbers),
+          numberOwners: Array.from(raffle.numberOwners.entries()),
+          participants: Array.from(raffle.participants.entries()),
+          phoneToNumbers: Array.from(raffle.phoneToNumbers.entries()),
+          emailToNumbers: Array.from(raffle.emailToNumbers.entries()),
+          participantToNumbers: Array.from(raffle.participantToNumbers.entries()),
+        } 
+      });
+    }
+  }, [raffle, isDbReady, isAdmin, prizeName, prizeImage, tempDescription]);
 
-  // Simulador de usuários online
   useEffect(() => {
     const interval = setInterval(() => {
-      setOnlineUsers(prev => {
-        const diff = Math.floor(Math.random() * 5) - 2;
-        return Math.max(80, prev + diff);
-      });
+      setOnlineUsers(prev => Math.max(80, prev + (Math.floor(Math.random() * 5) - 2)));
     }, 4000);
     return () => clearInterval(interval);
   }, []);
@@ -147,7 +150,7 @@ const App: React.FC = () => {
     setIsPurchasing([num]);
   };
 
-  const handlePurchase = useCallback(() => {
+  const handlePurchase = useCallback(async () => {
     if (!isPurchasing || !userName.trim() || !userPhone.trim() || !userEmail.trim()) {
       alert("Preencha todos os campos."); return;
     }
@@ -156,6 +159,9 @@ const App: React.FC = () => {
     const normalizedEmail = userEmail.trim().toLowerCase();
     const now = Date.now();
     const participantId = `p-${now}-${Math.random().toString(36).substr(2, 5)}`;
+
+    const newPurchase: Purchase = { number: isPurchasing[0], date: now, prizeName };
+    await dbService.saveMyPurchase(newPurchase);
 
     setRaffle((prev: RaffleState) => {
       const nextSold = new Set(prev.soldNumbers);
@@ -184,19 +190,45 @@ const App: React.FC = () => {
     });
 
     const newActivity: Activity = {
-      id: Math.random().toString(),
-      user: userName.split(' ')[0],
-      number: isPurchasing[0],
-      time: now,
-      type: 'purchase'
+      id: Math.random().toString(), user: userName.split(' ')[0],
+      number: isPurchasing[0], time: now, type: 'purchase'
     };
     
     raffleChannel.postMessage({ type: 'NEW_ACTIVITY', payload: newActivity });
     setActivities(prev => [newActivity, ...prev].slice(0, 5));
-    setMyPurchases(prev => [...isPurchasing.map(n => ({ number: n, date: now, prizeName })), ...prev]);
+    setMyPurchases(prev => [newPurchase, ...prev]);
     setIsPurchasing(null);
     setUserName(""); setUserPhone(""); setUserEmail("");
   }, [isPurchasing, userName, userPhone, userEmail, prizeName]);
+
+  // FIX: Implemented handleAdminLogin to process the admin password check.
+  const handleAdminLogin = () => {
+    if (adminPassInput === ADMIN_PASSWORD) {
+      setIsAdmin(true);
+      setIsAdminLoginOpen(false);
+      setAdminPassInput("");
+      localStorage.setItem('raffle_is_admin', 'true');
+    } else {
+      alert("Senha incorreta.");
+    }
+  };
+
+  const handleResetDatabase = async () => {
+    if (confirm("ATENÇÃO: Isso apagará todos os bilhetes vendidos e participantes da base de dados. Deseja continuar?")) {
+      await dbService.clearAll();
+      window.location.reload();
+    }
+  };
+
+  const handleExportData = () => {
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(raffle));
+    const downloadAnchorNode = document.createElement('a');
+    downloadAnchorNode.setAttribute("href",     dataStr);
+    downloadAnchorNode.setAttribute("download", "backup_rifa.json");
+    document.body.appendChild(downloadAnchorNode);
+    downloadAnchorNode.click();
+    downloadAnchorNode.remove();
+  };
 
   const numbersToDisplay = useMemo(() => {
     if (!searchQuery) {
@@ -222,7 +254,7 @@ const App: React.FC = () => {
         <div className="flex justify-center pt-4 gap-3">
            <div className={`flex items-center gap-2 px-4 py-2 bg-black/80 backdrop-blur rounded-full border border-white/10 shadow-2xl transition-all duration-500 ${isSyncing ? 'scale-110 border-orange-500' : 'scale-100'}`}>
               <div className={`w-2 h-2 rounded-full ${isSyncing ? 'bg-orange-500 shadow-[0_0_12px_rgba(249,115,22,1)]' : 'bg-emerald-500 pulse animate-pulse'}`}></div>
-              <span className="text-[10px] font-black text-white uppercase tracking-widest">{isSyncing ? 'Sincronizando...' : 'Sistema em Tempo Real'}</span>
+              <span className="text-[10px] font-black text-white uppercase tracking-widest">{isSyncing ? 'Syncing...' : (isDbReady ? 'Database Connected' : 'Connecting DB...')}</span>
            </div>
            <div className="flex items-center gap-2 px-4 py-2 bg-white/90 backdrop-blur rounded-full border border-slate-100 shadow-xl">
               <span className="text-[10px] font-black text-rose-600 uppercase tracking-widest flex items-center gap-1.5">
@@ -236,7 +268,7 @@ const App: React.FC = () => {
       {isAdmin && (
         <div className="fixed top-4 left-4 z-[160] flex gap-2">
           <button onClick={() => setIsAdmin(false)} className="bg-rose-600 text-white px-5 py-2.5 rounded-full text-xs font-black shadow-xl hover:bg-rose-700 transition-colors">SAIR ADM</button>
-          <button onClick={() => setIsAdminSettingsOpen(true)} className="bg-indigo-600 text-white px-5 py-2.5 rounded-full text-xs font-black shadow-xl hover:bg-indigo-700 transition-colors">CONFIGURAÇÕES</button>
+          <button onClick={() => setIsAdminSettingsOpen(true)} className="bg-indigo-600 text-white px-5 py-2.5 rounded-full text-xs font-black shadow-xl hover:bg-indigo-700 transition-colors">BASE DE DADOS</button>
         </div>
       )}
 
@@ -245,7 +277,13 @@ const App: React.FC = () => {
         <div className="absolute top-0 right-0 w-full h-full bg-[radial-gradient(circle_at_top_right,rgba(255,255,255,0.1),transparent)] pointer-events-none"></div>
         <div className="max-w-6xl mx-auto flex flex-col lg:flex-row gap-16 items-center relative z-10">
           <div className="flex-1 space-y-8">
-            <h1 className="text-6xl lg:text-9xl font-black tracking-tight leading-[0.8] uppercase italic drop-shadow-2xl animate-in slide-in-from-left duration-1000">{prizeName}</h1>
+            {/* Added onClick to open admin login by clicking the prize name title */}
+            <h1 
+              onClick={() => setIsAdminLoginOpen(true)}
+              className="text-6xl lg:text-9xl font-black tracking-tight leading-[0.8] uppercase italic drop-shadow-2xl animate-in slide-in-from-left duration-1000 cursor-pointer"
+            >
+              {prizeName}
+            </h1>
             <div className="flex flex-wrap gap-4">
                {["Siga os Patrocinadores", "Compartilhe nos Stories", "Curta a Foto"].map((step, i) => (
                   <div key={i} className="flex items-center gap-3 bg-black/30 px-5 py-3 rounded-2xl backdrop-blur-md border border-white/10 hover:border-orange-400 transition-all cursor-default">
@@ -336,6 +374,35 @@ const App: React.FC = () => {
         </div>
       )}
 
+      {/* Database/Admin Panel */}
+      {isAdminSettingsOpen && (
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-xl z-[400] flex items-center justify-center p-6">
+          <div className="bg-white w-full max-w-xl rounded-[48px] p-12 shadow-4xl">
+            <h3 className="text-3xl font-black mb-6 flex items-center gap-3 text-slate-900">
+               <svg className="w-8 h-8 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" /></svg>
+               Gestão da Base de Dados
+            </h3>
+            <div className="space-y-4">
+               <button onClick={handleExportData} className="w-full p-6 bg-slate-50 rounded-3xl flex items-center justify-between group hover:bg-white hover:shadow-lg transition-all border border-slate-100">
+                  <div className="text-left">
+                     <p className="font-black text-slate-800">Backup Completo</p>
+                     <p className="text-[11px] text-slate-400 font-medium">Exportar todos os dados em formato JSON</p>
+                  </div>
+                  <svg className="w-6 h-6 text-slate-300 group-hover:text-indigo-600 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+               </button>
+               <button onClick={handleResetDatabase} className="w-full p-6 bg-rose-50 rounded-3xl flex items-center justify-between group hover:bg-white hover:shadow-lg transition-all border border-rose-100">
+                  <div className="text-left">
+                     <p className="font-black text-rose-600">Resetar Rifa</p>
+                     <p className="text-[11px] text-rose-400 font-medium">Apagar permanentemente todos os bilhetes vendidos</p>
+                  </div>
+                  <svg className="w-6 h-6 text-rose-200 group-hover:text-rose-600 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+               </button>
+            </div>
+            <button onClick={() => setIsAdminSettingsOpen(false)} className="w-full mt-8 py-5 bg-slate-900 text-white rounded-3xl font-black uppercase text-xs tracking-widest shadow-xl">Fechar Painel</button>
+          </div>
+        </div>
+      )}
+
       {/* Floating Action Button */}
       <div className="fixed bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-4 z-[200]">
         <button onClick={() => setIsHistoryOpen(true)} className="bg-slate-900 text-white px-10 py-5 rounded-full shadow-4xl flex items-center gap-4 font-black text-sm tracking-tight hover:scale-110 transition-all border border-white/10 group">
@@ -370,7 +437,7 @@ const App: React.FC = () => {
                           <div className="text-5xl font-black text-slate-900 tracking-tighter group-hover:scale-105 transition-transform origin-left">#{p.number.toString().padStart(6, '0')}</div>
                           <div className="flex items-center gap-2 mt-2">
                              <div className="w-2 h-2 rounded-full bg-emerald-500"></div>
-                             <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Validado via Rede</span>
+                             <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Gravado em LocalDB</span>
                           </div>
                        </div>
                     </div>
@@ -379,6 +446,19 @@ const App: React.FC = () => {
             </div>
          </div>
       </div>
+
+      {isAdminLoginOpen && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-[500] flex items-center justify-center p-6">
+          <div className="bg-white w-full max-w-sm rounded-[40px] p-10 shadow-4xl animate-in fade-in duration-300">
+            <h3 className="text-2xl font-black text-center mb-10 text-slate-900">Acesso Restrito</h3>
+            <input type="password" value={adminPassInput} onChange={e => setAdminPassInput(e.target.value)} placeholder="Senha Admin" className="w-full p-5 bg-slate-50 rounded-2xl mb-8 outline-none font-black text-center border border-slate-100 focus:ring-2 focus:ring-indigo-500 transition-all" />
+            <div className="flex gap-4">
+              <button onClick={() => setIsAdminLoginOpen(false)} className="flex-1 py-4 font-black text-slate-400 uppercase text-xs">Sair</button>
+              <button onClick={handleAdminLogin} className="flex-1 py-4 bg-slate-900 text-white rounded-2xl font-black hover:bg-black transition-colors">ENTRAR</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
